@@ -1118,8 +1118,19 @@ static uint64_t compute_cmd14_hash(const uint8_t *data, uint8_t len) {
 }
 
 // ============================================================================
-// 5. XEN Protocol & kmbox Co-Processor Engine
+// 5. XEN Protocol & kmbox / MAKCU Co-Processor Engine
 // ============================================================================
+static uint8_t computeCrc8(const uint8_t *data, uint8_t len) {
+    uint8_t crc = 0x00;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t b = 0; b < 8; b++) {
+            crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) : (crc << 1);
+        }
+    }
+    return crc;
+}
+
 class XenKmboxEngine {
 public:
     // Core state mirroring disassembly 0x02C1..0x02CA
@@ -1209,7 +1220,7 @@ public:
         // Initial dynamic delimiters via deobfuscation
         start_byte = xen_deobfuscate(0);
         end_byte = xen_deobfuscate(0);
-        base_button_mask = xen_deobfuscate(0);
+        base_button_mask = 0;
 
         // Load smoothing setting from EEPROM (0x03FE)
         uint8_t sm = eeprom_read_byte((const uint8_t *)0x03FE);
@@ -1239,19 +1250,19 @@ public:
         int16_t comb_y = dy + accum_y;
         int8_t comb_w = wheel + accum_wheel;
 
-        accum_x = 0;
-        accum_y = 0;
-        accum_wheel = 0;
-
         uint32_t now = millis();
         if (comb_x != 0 || comb_y != 0) {
             last_move_time = now;
         }
 
-        // 4. Apply Smoothing Subsystem (0x10b2..0x12ac)
+        // 4. Apply Smoothing Subsystem (0x10b2..0x12ac) before clearing accum_x/y
         if (smoothing_enabled) {
             applySmoothing(now, comb_x, comb_y);
         }
+
+        accum_x = 0;
+        accum_y = 0;
+        accum_wheel = 0;
 
         out_dx = comb_x;
         out_dy = comb_y;
@@ -1265,7 +1276,7 @@ public:
     // Standalone Synthetic Report Evaluation (Disassembly 0x4b24..0x4dce)
     // ------------------------------------------------------------------------
     bool evaluateStandaloneReport(uint8_t &out_buttons, int16_t &out_dx, int16_t &out_dy, int8_t &out_wheel) {
-        uint8_t target_buttons = ((last_raw_phys_buttons | btn_or_mask) & (~btn_block_mask & 0x1F)) | base_button_mask;
+        uint8_t target_buttons = (last_raw_phys_buttons | btn_or_mask) & (~btn_block_mask & 0x1F);
         target_buttons &= 0x1F;
 
         if (accum_x == 0 && accum_y == 0 && accum_wheel == 0 && target_buttons == last_sent_pc_buttons) {
@@ -1324,24 +1335,111 @@ public:
         }
 
         while (Serial1.available() > 0) {
-            // Check for raw Handshake commands via peek
             int p = Serial1.peek();
-            if (p == 0x14) {
-                Serial1.read();
-                handleCmd14();
-                continue;
+
+            // 1. MAKCU 7-Byte CRC8 Binary Packet (0xA5)
+            if (p == 0xA5) {
+                if (Serial1.available() >= 7) {
+                    uint8_t pkt[7];
+                    for (uint8_t i = 0; i < 7; i++) pkt[i] = (uint8_t)Serial1.read();
+                    if (computeCrc8(pkt, 6) == pkt[6]) {
+                        accum_x += (int16_t)((uint16_t)pkt[1] | ((uint16_t)pkt[2] << 8));
+                        accum_y += (int16_t)((uint16_t)pkt[3] | ((uint16_t)pkt[4] << 8));
+                        btn_or_mask = pkt[5] & 0x1F;
+                        last_move_time = millis();
+                        continue;
+                    }
+                } else {
+                    break;
+                }
             }
-            if (p == 0x15) {
-                if (Serial1.available() < 33) {
-                    break; // Wait for full 33-byte packet
+
+            // 2. MAKCU V2 Binary Packet (0x50)
+            if (p == 0x50) {
+                if (Serial1.available() >= 5) {
+                    Serial1.read(); // 0x50
+                    uint8_t mc = (uint8_t)Serial1.read();
+                    uint8_t ml = (uint8_t)Serial1.read();
+                    Serial1.read(); // len_hi
+                    uint8_t p0 = (uint8_t)Serial1.read();
+                    if (mc == 0x08) setButtonMaskBit(0x01, p0);
+                    else if (mc == 0x11) setButtonMaskBit(0x02, p0);
+                    else if (mc == 0x0A) setButtonMaskBit(0x04, p0);
+                    else if (mc == 0x12) setButtonMaskBit(0x08, p0);
+                    else if (mc == 0x13) setButtonMaskBit(0x10, p0);
+                    else if (mc == 0x18) accum_wheel += (int8_t)p0;
+                    else if (mc == 0x04 && p0 >= 1 && p0 <= 5) setButtonMaskBit(1 << (p0 - 1), true);
+                    else if (mc == 0x0D && ml >= 4 && Serial1.available() >= 3) {
+                        uint8_t p1 = (uint8_t)Serial1.read();
+                        uint8_t p2 = (uint8_t)Serial1.read();
+                        uint8_t p3 = (uint8_t)Serial1.read();
+                        accum_x += (int16_t)((uint16_t)p0 | ((uint16_t)p1 << 8));
+                        accum_y += (int16_t)((uint16_t)p2 | ((uint16_t)p3 << 8));
+                        last_move_time = millis();
+                    } else if (mc == 0x0B && ml >= 6 && Serial1.available() >= 5) {
+                        btn_or_mask = p0 & 0x1F;
+                        int16_t mx = (int16_t)((uint16_t)Serial1.read() | ((uint16_t)Serial1.read() << 8));
+                        int16_t my = (int16_t)((uint16_t)Serial1.read() | ((uint16_t)Serial1.read() << 8));
+                        accum_wheel += (int8_t)Serial1.read();
+                        accum_x += mx; accum_y += my;
+                        last_move_time = millis();
+                    } else if (mc == 0xBF) {
+                        static const char vr[] PROGMEM = "\x50\xBF\x05\x00""4.105";
+                        writePgm(vr);
+                        continue;
+                    } else if (mc == 0xBB) {
+                        *(volatile uint16_t *)0x0800 = 0x7777;
+                        wdt_enable(WDTO_15MS);
+                        for (;;) {}
+                    }
+                    uint8_t ack[5] = {0x50, mc, 1, 0, 0};
+                    Serial1.write(ack, 5);
+                    continue;
+                } else {
+                    break;
                 }
-                Serial1.read(); // consume 0x15
-                uint8_t payload[32];
-                for (int i = 0; i < 32; i++) {
-                    payload[i] = (uint8_t)Serial1.read();
+            }
+
+            // 3. MAKCU V4 / DE AD Frame
+            if (p == 0xDE) {
+                if (Serial1.available() >= 8) {
+                    Serial1.read(); // 0xDE
+                    if (Serial1.read() == 0xAD) {
+                        Serial1.read(); Serial1.read(); // len
+                        if (Serial1.read() == 0xA5) { // baud change
+                            uint32_t b = 0;
+                            for (uint8_t i = 0; i < 4; i++) ((uint8_t*)&b)[i] = Serial1.read();
+                            if (b >= 9600 && b <= 4000000UL) {
+                                Serial1.flush();
+                                Serial1.begin(b);
+                            }
+                        }
+                    }
+                    continue;
+                } else {
+                    break;
                 }
-                handleCmd15(payload);
-                continue;
+            }
+
+            // Check for raw Handshake commands via peek
+            if (!in_packet) {
+                if (p == 0x14) {
+                    Serial1.read();
+                    handleCmd14();
+                    continue;
+                }
+                if (p == 0x15) {
+                    if (Serial1.available() < 33) {
+                        break; // Wait for full 33-byte packet
+                    }
+                    Serial1.read(); // consume 0x15
+                    uint8_t payload[32];
+                    for (int i = 0; i < 32; i++) {
+                        payload[i] = (uint8_t)Serial1.read();
+                    }
+                    handleCmd15(payload);
+                    continue;
+                }
             }
 
             uint8_t b = (uint8_t)Serial1.read();
@@ -1567,8 +1665,8 @@ private:
                         if (eeprom_read_byte((const uint8_t *)addr) != 0xAB) {
                             eeprom_update_byte((uint8_t *)addr, 0xAB);
                             eeprom_update_byte((uint8_t *)(addr + 1), cfg_len);
-                            if (cfg_len > 0 && cfg_len <= 129) {
-                                eeprom_update_block(&buf[2], (void *)(addr + 2), cfg_len);
+                            for (uint8_t k = 0; k < cfg_len && k < 129; k++) {
+                                eeprom_update_byte((uint8_t *)(addr + 2 + k), buf[2 + k]);
                             }
                             break;
                         }
@@ -1693,11 +1791,16 @@ private:
         return v;
     }
 
+    static void writePgm(const char *pgm_s) {
+        char c;
+        while ((c = (char)pgm_read_byte(pgm_s++))) {
+            Serial1.write((uint8_t)c);
+        }
+    }
+
     static void replyKmOk() {
         static const char ok_str[] PROGMEM = "km.ok\r\n";
-        for (uint8_t i = 0; i < 7; i++) {
-            Serial1.write((uint8_t)pgm_read_byte(&ok_str[i]));
-        }
+        writePgm(ok_str);
     }
 
     static const char* findChar(const char *s, char c) {
@@ -1706,46 +1809,90 @@ private:
     }
 
     void __attribute__((noinline)) parseKmboxAscii(const char *cmd) {
-        if (cmd[0] == 'p' && cmd[1] == 'i') {
+        const char *cptr = cmd;
+        skipSpaces(cptr);
+        if (cptr[0] == 'p' && cptr[1] == 'i') {
             replyKmOk();
             return;
         }
-        if (cmd[0] != 'k' || cmd[1] != 'm' || cmd[2] != '.') return;
+        if (cptr[0] == '.') {
+            cptr += 1;
+        } else if (cptr[0] == 'k' && cptr[1] == 'm' && cptr[2] == '.') {
+            cptr += 3;
+        } else {
+            return;
+        }
 
-        char c = cmd[3] | 0x20;
-        char c4 = cmd[4] | 0x20;
-        const char *p = findChar(cmd + 3, '(');
+        char c = cptr[0] | 0x20;
+        char c4 = cptr[1] | 0x20;
+        const char *p = findChar(cptr, '(');
         if (p) p++;
 
         uint8_t btn_bit = 0;
         if (c == 'l' && c4 == 'e') btn_bit = 0x01;
         else if (c == 'r') btn_bit = 0x02;
         else if (c == 'm' && c4 == 'i') btn_bit = 0x04;
-        else if (c == 's') btn_bit = (cmd[7] == '2') ? 0x10 : 0x08;
+        else if (c == 's') btn_bit = (cptr[4] == '2' || (p && *(p-2) == '2')) ? 0x10 : 0x08;
 
         if (btn_bit) {
+            skipSpaces(p);
+            if (*p == ')' || *p == '\0') {
+                uint8_t st = (btn_or_mask & btn_bit) ? 2 : ((last_raw_phys_buttons & btn_bit) ? 1 : 0);
+                static const char p_km[] PROGMEM = "km.";
+                static const char p_l[] PROGMEM = "left(";
+                static const char p_r[] PROGMEM = "right(";
+                static const char p_m[] PROGMEM = "middle(";
+                static const char p_s[] PROGMEM = "side1(";
+                writePgm(p_km);
+                writePgm((btn_bit==1)?p_l:(btn_bit==2)?p_r:(btn_bit==4)?p_m:p_s);
+                Serial1.write((uint8_t)('0' + st));
+                Serial1.write((const uint8_t*)")\r\n", 3);
+                return;
+            }
             setButtonMaskBit(btn_bit, parseI16(p) != 0);
         } else if (c == 'm') {
-            if (c4 == 'o') { // km.move(x,y)
-                accum_x += parseI16(p);
-                if (*p == ',') p++;
-                accum_y += parseI16(p);
-                last_move_time = millis();
+            if (c4 == 'o') { // km.move(x,y) or km.mo(...)
+                if (cptr[2] == '(') { // km.mo(buttons,x,y,wheel,pan,tilt)
+                    btn_or_mask = parseU8(p) & 0x1F;
+                    if (*p == ',') p++;
+                    accum_x += parseI16(p);
+                    if (*p == ',') p++;
+                    accum_y += parseI16(p);
+                    if (*p == ',') p++;
+                    accum_wheel += (int8_t)parseI16(p);
+                    last_move_time = millis();
+                } else {
+                    accum_x += parseI16(p);
+                    if (*p == ',') p++;
+                    accum_y += parseI16(p);
+                    last_move_time = millis();
+                }
             } else if (c4 == 'a') { // km.mask(or,block)
-                btn_or_mask = parseU8(p);
+                btn_or_mask = parseU8(p) & 0x1F;
                 if (*p == ',') p++;
-                btn_block_mask = parseU8(p);
+                btn_block_mask = parseU8(p) & 0x1F;
             }
         } else if (c == 'l' && c4 == 'i') { // km.listen(v)
             btn_report_enabled = (parseI16(p) != 0) ? 1 : 0;
         } else if (c == 'w') { // km.wheel(w)
             accum_wheel += (int8_t)parseI16(p);
-        } else if (c == 'c') { // km.click()
-            btn_or_mask |= 0x01;
-            btn_block_mask &= ~0x01;
+        } else if (c == 'c') { // km.click(btn)
+            uint8_t b = parseU8(p);
+            if (b >= 1 && b <= 5) setButtonMaskBit(1 << (b - 1), true);
+            else setButtonMaskBit(0x01, true);
         } else if (c == 'u') { // km.unmask()
             btn_or_mask = 0;
             btn_block_mask = 0;
+        } else if (c == 'v') { // km.version()
+            static const char p_ver[] PROGMEM = "km.version(4.105)\r\n";
+            writePgm(p_ver);
+            return;
+        } else if (c == 'i') { // km.init()
+            btn_or_mask = 0;
+            btn_block_mask = 0;
+            accum_x = 0;
+            accum_y = 0;
+            accum_wheel = 0;
         } else if (c == 'b') { // km.baud(rate) or km.boot()
             if (c4 == 'o') {
                 *(volatile uint16_t *)0x0800 = 0x7777;
