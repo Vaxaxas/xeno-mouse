@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+build/
+universal_build/
+bridge_config.json
+*.hex
+*.elf
+*.eep
+*.bin
