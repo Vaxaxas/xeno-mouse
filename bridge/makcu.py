@@ -55,7 +55,9 @@ class Makcu:
         self.ser.write(cmd_str.encode("ascii"))
         resp = self.ser.read_until(b">>> ")
         if not resp:
-            resp = self.ser.read(64)
+            resp = self.ser.read_until(b"\n")
+            if self.ser.in_waiting:
+                resp += self.ser.read(self.ser.in_waiting)
         return resp.decode("ascii", errors="ignore").strip()
 
     # -------------------------------------------------------------------------

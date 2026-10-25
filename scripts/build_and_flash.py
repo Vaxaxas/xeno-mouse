@@ -6,7 +6,9 @@ Compiles with -DCDC_DISABLED and -mcall-prologues for minimal footprint and pure
 Supports automatic remote bootloader trigger via km.boot() and manual physical RESET detection.
 """
 
+import glob
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -19,12 +21,27 @@ BUILD_DIR = os.path.join(BASE_DIR, "build")
 
 
 def find_arduino_tools():
-    arduino_cli = r"C:\Users\fi\.arduino-tools\arduino-cli.exe"
-    if not os.path.exists(arduino_cli):
-        arduino_cli = "arduino-cli"
+    arduino_cli = "arduino-cli"
+    for candidate in [
+        os.path.expanduser("~/.arduino-tools/arduino-cli.exe"),
+        r"C:\Users\fi\.arduino-tools\arduino-cli.exe",
+        shutil.which("arduino-cli"),
+    ]:
+        if candidate and os.path.exists(candidate):
+            arduino_cli = candidate
+            break
 
-    avrdude = r"C:\Users\fi\AppData\Local\Arduino15\packages\arduino\tools\avrdude\8.0.0-arduino1\bin\avrdude.exe"
-    conf = r"C:\Users\fi\AppData\Local\Arduino15\packages\arduino\tools\avrdude\8.0.0-arduino1\etc\avrdude.conf"
+    avrdude = "avrdude"
+    conf = ""
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    if local_app_data:
+        pattern = os.path.join(local_app_data, "Arduino15", "packages", "arduino", "tools", "avrdude", "**", "bin", "avrdude.exe")
+        matches = glob.glob(pattern, recursive=True)
+        if matches:
+            avrdude = matches[0]
+            conf_matches = glob.glob(os.path.join(os.path.dirname(os.path.dirname(avrdude)), "etc", "avrdude.conf"))
+            if conf_matches:
+                conf = conf_matches[0]
     return arduino_cli, avrdude, conf
 
 
